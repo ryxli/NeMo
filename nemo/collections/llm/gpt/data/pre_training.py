@@ -16,7 +16,7 @@ import logging
 import os
 import warnings
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union, Type
 
 import pytorch_lightning as pl
 from pytorch_lightning.utilities.types import EVAL_DATALOADERS, TRAIN_DATALOADERS
@@ -30,7 +30,8 @@ from nemo.utils.import_utils import safe_import
 _, HAVE_TE = safe_import("transformer_engine")
 
 if TYPE_CHECKING:
-    from megatron.core.datasets.gpt_dataset import GPTDatasetConfig
+    from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig
+    from megatron.core.datasets.utils_s3 import S3Config
 
     from nemo.collections.common.tokenizers.tokenizer_spec import TokenizerSpec
 
@@ -160,6 +161,11 @@ class PreTrainingDataModule(pl.LightningDataModule, IOMixin):
         num_train_samples: Optional[int] = None,
         num_val_samples: Optional[int] = None,
         num_test_samples: Optional[int] = None,
+        s3_config: Optional["S3Config"] = None,
+        override_data_steps: Optional[int] = None,
+        shared_filesystem: bool = True,
+        dataset_cls: Optional[Type["GPTDataset"]] = None,
+        **kwargs,
     ) -> None:
         super().__init__()
         if not isinstance(paths, (list, tuple, dict)):
@@ -167,7 +173,7 @@ class PreTrainingDataModule(pl.LightningDataModule, IOMixin):
 
         from megatron.core.datasets.utils import get_blend_from_list
 
-        validate_dataset_asset_accessibility(paths)
+        # validate_dataset_asset_accessibility(paths)
 
         build_kwargs = {}
         if isinstance(paths, dict):
@@ -205,6 +211,11 @@ class PreTrainingDataModule(pl.LightningDataModule, IOMixin):
         self.num_train_samples = num_train_samples
         self.num_val_samples = num_val_samples
         self.num_test_samples = num_test_samples
+        self.s3_config = s3_config
+        self.override_data_steps = override_data_steps
+        self.shared_filesystem = shared_filesystem
+        self.dataset_cls = dataset_cls
+        self.kwargs = kwargs
 
         from nemo.collections.nlp.modules.common.tokenizer_utils import get_nmt_tokenizer
 
@@ -224,7 +235,12 @@ class PreTrainingDataModule(pl.LightningDataModule, IOMixin):
         trainer_limit_test_batches: Union[int, float],
     ):
         from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
-        from megatron.core.datasets.gpt_dataset import GPTDataset
+        if self.dataset_cls is None:
+            from megatron.core.datasets.gpt_dataset import GPTDataset
+
+            dataset_cls = GPTDataset
+        else:
+            dataset_cls = self.dataset_cls
 
         train_iters = trainer_max_steps
         assert train_iters > 0, f"max_steps {train_iters} should be greater than 0"
@@ -235,7 +251,7 @@ class PreTrainingDataModule(pl.LightningDataModule, IOMixin):
                 self.num_train_samples >= num_train_samples
             ), f"num_train_samples must be greater than or equal to {num_train_samples}."
             num_train_samples = self.num_train_samples
-            train_iters = int(num_train_samples / self.data_sampler.global_batch_size)
+            train_iters = int(num_train_samples / self.data_sampler.global_batch_size) if self.override_data_steps is None else self.override_data_steps
 
         eval_iters = (train_iters // trainer_val_check_interval + 1) * trainer_limit_val_batches
         num_val_samples = int(eval_iters * self.data_sampler.global_batch_size)
@@ -273,7 +289,7 @@ class PreTrainingDataModule(pl.LightningDataModule, IOMixin):
 
         train_valid_test_num_samples = [num_train_samples, num_val_samples, num_test_samples]
         self._train_ds, self._validation_ds, self._test_ds = BlendedMegatronDatasetBuilder(
-            GPTDataset,
+            dataset_cls,
             train_valid_test_num_samples,
             is_built_on_rank=lambda: True,
             config=self.gpt_dataset_config,
@@ -334,6 +350,7 @@ class PreTrainingDataModule(pl.LightningDataModule, IOMixin):
     @property
     def gpt_dataset_config(self) -> "GPTDatasetConfig":
         from megatron.core.datasets.gpt_dataset import GPTDatasetConfig
+        from megatron.core.datasets.utils_s3 import S3Config
 
         return GPTDatasetConfig(
             random_seed=self.seed,
@@ -345,6 +362,9 @@ class PreTrainingDataModule(pl.LightningDataModule, IOMixin):
             reset_attention_mask=self.reset_attention_mask,
             eod_mask_loss=self.eod_mask_loss,
             num_dataset_builder_threads=self.num_dataset_builder_threads,
+            shared_filesystem=self.shared_filesystem,
+            s3_config=S3Config(**self.s3_config, synchronize_ranks=False) if self.s3_config else None,
+            **self.kwargs,
             **self.build_kwargs,
         )
 

@@ -22,6 +22,8 @@ import torch
 from pytorch_lightning.overrides.distributed import _IndexBatchSamplerWrapper
 from torch.utils.data import DataLoader, Dataset
 
+from nemo.collections.nlp.data.language_modeling.megatron.data_samplers import MegatronCorePretrainingSampler
+
 
 ## TODO: remove? unused
 def create_dataloader(
@@ -178,7 +180,7 @@ def add_megatron_sampler(
         DataLoader: A new DataLoader instance with the configured Megatron sampler.
     """
     if dataloader_type == 'single':
-        batch_sampler = MegatronPretrainingSampler(
+        batch_sampler = MegatronCorePretrainingSampler(
             total_samples=len(dataloader.dataset),
             consumed_samples=consumed_samples,
             micro_batch_size=micro_batch_size,

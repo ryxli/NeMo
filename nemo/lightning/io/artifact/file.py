@@ -15,6 +15,7 @@
 import os
 import shutil
 from pathlib import Path
+from pathlib_abc import PathBase
 from typing import Union
 import fiddle as fdl
 
@@ -43,22 +44,26 @@ class FileArtifact(Artifact[str]):
 
 
 def pathize(s):
-    if not isinstance(s, Path):
+    if not isinstance(s, PathBase):
         return Path(s)
     return s
 
 
-def copy_file(src: Union[Path, str], path: Union[Path, str], relative_dst: Union[Path, str]):
+def copy_file(src: Union[os.PathLike, PathBase], path: Union[os.PathLike, PathBase], relative_dst: Union[os.PathLike, PathBase]):
     relative_path = pathize(relative_dst) / pathize(src).name
-    output = pathize(path) / relative_path
+    output = pathize(path) / str(relative_path)
     if output.exists():
         raise FileExistsError(f"Dst file already exists {str(output)}")
-    shutil.copy2(src, output)
+    if isinstance(output, (os.PathLike, Path)):
+        shutil.copy2(src, output)
+    else:
+        with output.open('w') as writer, Path(src).open('r') as reader:
+            writer.write(reader.read())
     return relative_path
 
 
 class DirArtifact(Artifact[str]):
-    def dump(self, value: str, absolute_dir: Path, relative_dir: Path) -> str:
+    def dump(self, value: str, absolute_dir: os.PathLike | PathBase, relative_dir: os.PathLike | PathBase) -> str:
         value = pathize(value)
         absolute_dir = pathize(absolute_dir)
         relative_dir = pathize(relative_dir)
@@ -66,7 +71,7 @@ class DirArtifact(Artifact[str]):
             return value
 
         relative_dir = relative_dir / value.name
-        os.makedirs(str(absolute_dir / relative_dir), exist_ok=True)
+        (absolute_dir / str(relative_dir)).mkdir(exist_ok=True)
         for file in value.iterdir():
             copy_file(file, absolute_dir, relative_dir)
         return str(relative_dir)

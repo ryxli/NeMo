@@ -480,6 +480,8 @@ class CosineAnnealingScheduler(LRSchedulerModule):
                 # `scheduler.step()`. 1 corresponds to updating the learning
                 # rate after every epoch/step.
                 "frequency": self.frequency,
+                # Metric to to monitor for schedulers like `ReduceLROnPlateau`
+                "monitor": self.monitor,
             },
             # Metric to to monitor for schedulers like `ReduceLROnPlateau`
             "monitor": self.monitor,

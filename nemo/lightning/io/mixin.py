@@ -15,6 +15,7 @@
 import functools
 import inspect
 import json
+import os
 import shutil
 import threading
 import types
@@ -22,6 +23,8 @@ import uuid
 from copy import deepcopy
 from dataclasses import is_dataclass
 from pathlib import Path
+from numpy import isin
+from pathlib_abc import PathBase
 from pydoc import locate
 from typing import Any, Callable, Dict, List, Optional, Type, TypeVar, Union
 
@@ -210,7 +213,7 @@ class IOMixin:
     def io_artifacts(cls) -> List[Artifact]:
         return []
 
-    def io_dump(self, output: Path, yaml_attrs: list[str]):
+    def io_dump(self, output: PathBase, yaml_attrs: list[str]):
         """
         Serializes the configuration object (`__io__`) to a file, allowing the object state to be
         saved and later restored. Also creates an artifacts directory and stores it in a thread-local
@@ -220,9 +223,15 @@ class IOMixin:
             output (Path): The path to the directory where the configuration object and artifacts
                            will be stored.
         """
-        output_path = Path(output)
+        output_path = output
+        if not isinstance(output, PathBase):
+            output_path = Path(output)
         local_artifacts_dir = "."
-        artifacts_dir = output_path / local_artifacts_dir
+
+        if isinstance(output_path, Path):
+            artifacts_dir = output_path / local_artifacts_dir
+        else:
+            artifacts_dir = Path("/tmp") / output_path.stem / local_artifacts_dir
         artifacts_dir.mkdir(parents=True, exist_ok=True)
 
         # Store artifacts directory in thread-local storage
@@ -230,7 +239,7 @@ class IOMixin:
         _thread_local.output_path = output_path
 
         config_path = output_path / "io.json"
-        with open(config_path, "w") as f:
+        with config_path.open("w") as f:
             io = deepcopy(self.__io__)
             _artifact_transform_save(io, output_path, local_artifacts_dir)
             json = serialization.dump_json(io)
@@ -599,8 +608,8 @@ def _io_flatten_object(instance):
 
         local_artifact_path = Path(_thread_local.local_artifacts_dir) / f"{uuid.uuid4()}"
         output_path = _thread_local.output_path
-        artifact_path = output_path / local_artifact_path
-        with open(artifact_path, "wb") as f:
+        artifact_path = output_path / str(local_artifact_path)
+        with artifact_path.open("wb") as f:
             dump(getattr(instance, "__io__", instance), f)
         return (str(local_artifact_path),), None
 
@@ -628,7 +637,7 @@ def _io_path_elements_fn(x):
     return x.__io__.__path_elements__()
 
 
-def _artifact_transform_save(cfg: fdl.Config, output_path: Path, relative_dir: Path = "."):
+def _artifact_transform_save(cfg: fdl.Config, output_path: os.PathLike | PathBase, relative_dir: Path = "."):
     for artifact in getattr(cfg.__fn_or_cls__, "__io_artifacts__", []):
         # Allow optional artifacts
         if artifact.skip or (not hasattr(cfg, artifact.attr) and not artifact.required):
@@ -683,7 +692,7 @@ def _artifact_transform_load(cfg: fdl.Config, path: Path):
             pass
 
 
-def load(path: Path, output_type: Type[CkptType] = Any, subpath: Optional[str] = None, build: bool = True) -> CkptType:
+def load(path: Path | PathBase, output_type: Type[CkptType] = Any, subpath: Optional[str] = None, build: bool = True) -> CkptType:
     """
     Loads a configuration from a pickle file and constructs an object of the specified type.
 
@@ -703,13 +712,15 @@ def load(path: Path, output_type: Type[CkptType] = Any, subpath: Optional[str] =
     Example:
         loaded_model = load("/path/to/model", output_type=MyModel)
     """
-    _path = Path(path)
+    _path = path
+    if not isinstance(path, PathBase):
+        _path = Path(path)
     _thread_local.output_dir = _path
 
     if hasattr(_path, "is_dir") and _path.is_dir():
-        _path = Path(_path) / "io.json"
+        _path = _path / "io.json"
     elif hasattr(_path, "isdir") and _path.isdir:
-        _path = Path(_path) / "io.json"
+        _path = _path / "io.json"
 
     if not _path.is_file():
         raise FileNotFoundError(f"No such file: '{_path}'")
@@ -718,7 +729,7 @@ def load(path: Path, output_type: Type[CkptType] = Any, subpath: Optional[str] =
         subpath = "<root>." + subpath
 
     ## add IO functionality to custom objects present in the json file
-    with open(_path) as f:
+    with _path.open() as f:
         j = json.load(f)
     for obj, val in j.get("objects", {}).items():
         clss = ".".join([val["type"]["module"], val["type"]["name"]])
@@ -729,7 +740,7 @@ def load(path: Path, output_type: Type[CkptType] = Any, subpath: Optional[str] =
         if not serialization.find_node_traverser(locate(clss)):
             track_io(locate(clss))
 
-    with open(_path, "rb") as f:
+    with _path.open("rb") as f:
         json_config = json.loads(f.read())
 
     root_key = None

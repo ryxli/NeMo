@@ -1279,7 +1279,9 @@ class SkipResumeTrainingValidationLoop(_TrainingEpochLoop):
     """
 
     def _should_check_val_fx(self, data_fetcher) -> bool:
-        if self.restarting and self.global_step % self.trainer.val_check_batch == 0:
+        # when restarting, do not run val
+        # https://github.com/Lightning-AI/pytorch-lightning/pull/11552
+        if self.restarting:
             return False
         return super()._should_check_val_fx(data_fetcher)
 

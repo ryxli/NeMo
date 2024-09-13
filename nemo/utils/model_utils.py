@@ -24,6 +24,7 @@ from dataclasses import dataclass, is_dataclass
 from enum import Enum
 from functools import lru_cache
 from pathlib import Path
+from pathlib_abc import PathBase
 from typing import List, Optional, Tuple, Type, Union
 
 import wrapt
@@ -705,7 +706,9 @@ def ckpt_to_dir(filepath: Union[str, Path]) -> Path:
     to be used as a directory for distributed checkpoints
     """
 
-    filepath = Path(filepath)
+    if not isinstance(filepath, PathBase):
+        filepath = Path(filepath)
+
     # if it is already a distributed checkpoint, then return
     if filepath.suffix != ".ckpt" and filepath.is_dir():
         return filepath

@@ -13,7 +13,9 @@
 # limitations under the License.
 
 from pathlib import Path
+from pathlib_abc import PathBase
 from typing import Union
+from os import PathLike
 
 # NeMo2 checkpoint structure is a checkpoint directory, with a WEIGHTS_PATH and CONTEXT_PATH subdirectory structure.
 #  WEIGHTS_PATH stores the weights while CONTEXT_PATH stores the hyper-parameters.
@@ -22,10 +24,10 @@ CONTEXT_PATH: str = "context"
 ADAPTER_META_FILENAME = "adapter_metadata.json"
 
 
-def idempotent_path_append(base_dir: Union[str, Path], suffix) -> Path:
+def idempotent_path_append(base_dir: Union[PathLike, PathBase], suffix) -> PathBase:
     from nemo.lightning.resume import AdapterPath
 
-    assert isinstance(base_dir, Path)
+    assert isinstance(base_dir, PathBase)
     if base_dir.parts[-1] != suffix:
         base_dir = base_dir / suffix
     if isinstance(base_dir, AdapterPath) and base_dir.base_model_path.parts[-1] != suffix:
@@ -33,13 +35,13 @@ def idempotent_path_append(base_dir: Union[str, Path], suffix) -> Path:
     return base_dir
 
 
-def ckpt_to_context_subdir(filepath: Union[str, Path]) -> Path:
+def ckpt_to_context_subdir(filepath: Union[PathLike, PathBase]) -> PathBase:
     """Given an input checkpoint filepath, clean it using `ckpt_to_dir` and then return the context subdirectory."""
     base_dir = ckpt_to_dir(filepath=filepath)
     return idempotent_path_append(base_dir, CONTEXT_PATH)
 
 
-def ckpt_to_dir(filepath: Union[str, Path]) -> Path:
+def ckpt_to_dir(filepath: Union[PathLike, PathBase]) -> PathBase:
     """PTL considers checkpoints as .ckpt files.
     This method removes the extension and returns a path
     to be used as a directory for distributed checkpoints
@@ -48,7 +50,8 @@ def ckpt_to_dir(filepath: Union[str, Path]) -> Path:
 
     if isinstance(filepath, AdapterPath):
         return filepath
-    filepath = Path(filepath)
+    if not isinstance(filepath, PathBase):
+        filepath = Path(filepath)
     if not filepath.suffix == ".ckpt":
         filepath = filepath.with_suffix(filepath.suffix + ".ckpt")
 
