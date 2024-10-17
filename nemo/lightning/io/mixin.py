@@ -1,6 +1,7 @@
 import functools
 import inspect
 import json
+import os
 import shutil
 import threading
 import types
@@ -8,6 +9,7 @@ import uuid
 from copy import deepcopy
 from dataclasses import is_dataclass
 from pathlib import Path
+from pathlib_abc import PathBase
 from pydoc import locate
 from typing import Any, Callable, Dict, List, Optional, Type, TypeVar, Union
 
@@ -35,7 +37,9 @@ _enable_ext()
 _thread_local = threading.local()
 
 
-def _ordered_arguments_with_default(data: config_lib.Config) -> Dict[Union[int, str], Any]:
+def _ordered_arguments_with_default(
+    data: config_lib.Config,
+) -> Dict[Union[int, str], Any]:
     result = config_lib.ordered_arguments(data, include_defaults=True)
     for key, arg in result.items():
         if isinstance(arg, config_lib.Config):
@@ -44,7 +48,8 @@ def _ordered_arguments_with_default(data: config_lib.Config) -> Dict[Union[int, 
 
     if "__fn_or_cls__" in result:
         raise ValueError(
-            "It is not supported to dump objects of functions/classes " "that have a __fn_or_cls__ parameter."
+            "It is not supported to dump objects of functions/classes "
+            "that have a __fn_or_cls__ parameter."
         )
 
     result["_target_"] = (
@@ -163,7 +168,7 @@ class IOMixin:
     def io_artifacts(cls) -> List[Artifact]:
         return []
 
-    def io_dump(self, output: Path, yaml_attrs: list[str]):
+    def io_dump(self, output: os.PathLike | PathBase, yaml_attrs: list[str]):
         """
         Serializes the configuration object (`__io__`) to a file, allowing the object state to be
         saved and later restored. Also creates an artifacts directory and stores it in a thread-local
@@ -173,9 +178,15 @@ class IOMixin:
             output (Path): The path to the directory where the configuration object and artifacts
                            will be stored.
         """
-        output_path = Path(output)
+        output_path = output
+        if not isinstance(output, PathBase):
+            output_path = Path(output)
         local_artifacts_dir = "."
-        artifacts_dir = output_path / local_artifacts_dir
+
+        if isinstance(output_path, Path):
+            artifacts_dir = output_path / local_artifacts_dir
+        else:
+            artifacts_dir = Path("/tmp") / output_path.stem / local_artifacts_dir
         artifacts_dir.mkdir(parents=True, exist_ok=True)
 
         # Store artifacts directory in thread-local storage
@@ -183,7 +194,7 @@ class IOMixin:
         _thread_local.output_path = output_path
 
         config_path = output_path / "io.json"
-        with open(config_path, "w") as f:
+        with config_path.open("w") as f:
             io = deepcopy(self.__io__)
             _artifact_transform_save(io, output_path, local_artifacts_dir)
             json = serialization.dump_json(io)
@@ -208,10 +219,17 @@ class IOMixin:
         original_representers = yaml.SafeDumper.yaml_representers.copy()
 
         from nemo_run.config import Config, Partial
-        from nemo_run.core.serialization.yaml import YamlSerializer, _function_representer
+        from nemo_run.core.serialization.yaml import (
+            YamlSerializer,
+            _function_representer,
+        )
 
-        yaml.SafeDumper.add_representer(config_lib.Config, _config_representer_with_defaults)
-        yaml.SafeDumper.add_representer(partial.Partial, _partial_representer_with_defaults)
+        yaml.SafeDumper.add_representer(
+            config_lib.Config, _config_representer_with_defaults
+        )
+        yaml.SafeDumper.add_representer(
+            partial.Partial, _partial_representer_with_defaults
+        )
         yaml.SafeDumper.add_representer(Config, _config_representer_with_defaults)
         yaml.SafeDumper.add_representer(Partial, _partial_representer_with_defaults)
 
@@ -267,7 +285,9 @@ class ConnectorMixin:
         return output
 
     @classmethod
-    def register_importer(cls, ext: str, default_path: Optional[str] = None) -> Callable[[Type[ConnT]], Type[ConnT]]:
+    def register_importer(
+        cls, ext: str, default_path: Optional[str] = None
+    ) -> Callable[[Type[ConnT]], Type[ConnT]]:
         """
         A class method decorator to register a model connector as an importer for a specific file
         extension.
@@ -290,7 +310,9 @@ class ConnectorMixin:
         return decorator
 
     @classmethod
-    def register_exporter(cls, ext: str, default_path: Optional[str] = None) -> Callable[[Type[ConnT]], Type[ConnT]]:
+    def register_exporter(
+        cls, ext: str, default_path: Optional[str] = None
+    ) -> Callable[[Type[ConnT]], Type[ConnT]]:
         """
         A class method decorator to register a model connector as an exporter for a specific file
         extension.
@@ -342,7 +364,13 @@ class ConnectorMixin:
         """
         return cls._get_connector(ext, path, importer=False)
 
-    def import_ckpt(self, path: str, overwrite: bool = False, base_path: Optional[Path] = None, **kwargs) -> Path:
+    def import_ckpt(
+        self,
+        path: str,
+        overwrite: bool = False,
+        base_path: Optional[Path] = None,
+        **kwargs,
+    ) -> Path:
         """
         Imports a checkpoint from a specified path, potentially overwriting existing files.
 
@@ -368,7 +396,11 @@ class ConnectorMixin:
 
     @classmethod
     def _get_connector(
-        cls, ext: Union[str, Path], path: Optional[Union[str, Path]] = None, importer: bool = True, **kwargs
+        cls,
+        ext: Union[str, Path],
+        path: Optional[Union[str, Path]] = None,
+        importer: bool = True,
+        **kwargs,
     ) -> ModelConnector:
         """
         Retrieves the appropriate model connector based on the file extension and path,
@@ -395,13 +427,20 @@ class ConnectorMixin:
         else:
             _path = str(path)
 
-        connector = cls._IMPORTERS.get(str(cls) + ext) if importer else cls._EXPORTERS.get(str(cls) + ext)
+        connector = (
+            cls._IMPORTERS.get(str(cls) + ext)
+            if importer
+            else cls._EXPORTERS.get(str(cls) + ext)
+        )
         if not connector:
             raise ValueError(f"No connector found for extension '{ext}'")
 
         if not _path:
             if not connector.default_path:
-                raise ValueError(f"No default path specified for extension '{ext}'. ", "Please provide a path")
+                raise ValueError(
+                    f"No default path specified for extension '{ext}'. ",
+                    "Please provide a path",
+                )
 
             return connector()
 
@@ -426,7 +465,11 @@ def track_io(target, artifacts: Optional[List[Artifact]] = None):
     """
 
     def _add_io_to_class(cls):
-        if inspect.isclass(cls) and hasattr(cls, "__init__") and not hasattr(cls, "__io__"):
+        if (
+            inspect.isclass(cls)
+            and hasattr(cls, "__init__")
+            and not hasattr(cls, "__io__")
+        ):
             if cls in [str, int, float, tuple, list, dict, bool, type(None)]:
                 return cls
 
@@ -437,12 +480,16 @@ def track_io(target, artifacts: Optional[List[Artifact]] = None):
 
     def _process_module(module):
         for name, obj in inspect.getmembers(module):
-            if inspect.isclass(obj) and _is_defined_in_module_or_submodules(obj, module):
+            if inspect.isclass(obj) and _is_defined_in_module_or_submodules(
+                obj, module
+            ):
                 setattr(module, name, _add_io_to_class(obj))
         return module
 
     def _is_defined_in_module_or_submodules(obj, module):
-        return obj.__module__ == module.__name__ or obj.__module__.startswith(f"{module.__name__}.")
+        return obj.__module__ == module.__name__ or obj.__module__.startswith(
+            f"{module.__name__}."
+        )
 
     if isinstance(target, types.ModuleType):
         return _process_module(target)
@@ -476,7 +523,9 @@ def _io_transform_args(self, init_fn, *args, **kwargs) -> Dict[str, Any]:
         if isinstance(config_kwargs[key], IOProtocol):
             config_kwargs[key] = config_kwargs[key].__io__
         if is_dataclass(config_kwargs[key]):
-            config_kwargs[key] = fdl_dc.convert_dataclasses_to_configs(config_kwargs[key], allow_post_init=True)
+            config_kwargs[key] = fdl_dc.convert_dataclasses_to_configs(
+                config_kwargs[key], allow_post_init=True
+            )
             # Check if the arg is a factory (dataclasses.field)
         if config_kwargs[key].__class__.__name__ == "_HAS_DEFAULT_FACTORY_CLASS":
             to_del.append(key)
@@ -547,13 +596,17 @@ def _io_flatten_object(instance):
     try:
         serialization.dump_json(instance.__io__)
     except (serialization.UnserializableValueError, AttributeError) as e:
-        if not hasattr(_thread_local, "local_artifacts_dir") or not hasattr(_thread_local, "output_path"):
+        if not hasattr(_thread_local, "local_artifacts_dir") or not hasattr(
+            _thread_local, "output_path"
+        ):
             raise e
 
-        local_artifact_path = Path(_thread_local.local_artifacts_dir) / f"{uuid.uuid4()}"
+        local_artifact_path = (
+            Path(_thread_local.local_artifacts_dir) / f"{uuid.uuid4()}"
+        )
         output_path = _thread_local.output_path
         artifact_path = output_path / local_artifact_path
-        with open(artifact_path, "wb") as f:
+        with artifact_path.open("wb") as f:
             dump(getattr(instance, "__io__", instance), f)
         return (str(local_artifact_path),), None
 
@@ -581,7 +634,9 @@ def _io_path_elements_fn(x):
     return x.__io__.__path_elements__()
 
 
-def _artifact_transform_save(cfg: fdl.Config, output_path: Path, relative_dir: Path = "."):
+def _artifact_transform_save(
+    cfg: fdl.Config, output_path: os.PathLike | PathBase, relative_dir: Path = "."
+):
     for artifact in getattr(cfg.__fn_or_cls__, "__io_artifacts__", []):
         # Allow optional artifacts
         if artifact.skip:
@@ -589,7 +644,9 @@ def _artifact_transform_save(cfg: fdl.Config, output_path: Path, relative_dir: P
         current_val = getattr(cfg, artifact.attr)
         if current_val is None:
             if artifact.required:
-                raise ValueError(f"Artifact '{artifact.attr}' is required but not provided")
+                raise ValueError(
+                    f"Artifact '{artifact.attr}' is required but not provided"
+                )
             continue
         ## dump artifact and return the relative path
         new_val = artifact.dump(current_val, output_path, relative_dir)
@@ -598,7 +655,11 @@ def _artifact_transform_save(cfg: fdl.Config, output_path: Path, relative_dir: P
     for attr in dir(cfg):
         try:
             if isinstance(getattr(cfg, attr), fdl.Config):
-                _artifact_transform_save(getattr(cfg, attr), output_path=output_path, relative_dir=relative_dir)
+                _artifact_transform_save(
+                    getattr(cfg, attr),
+                    output_path=output_path,
+                    relative_dir=relative_dir,
+                )
         except ValueError:
             pass
 
@@ -623,7 +684,11 @@ def _artifact_transform_load(cfg: fdl.Config, path: Path):
             pass
 
 
-def load(path: Path, output_type: Type[CkptType] = Any, subpath: Optional[str] = None) -> CkptType:
+def load(
+    path: Path | PathBase,
+    output_type: Type[CkptType] = Any,
+    subpath: Optional[str] = None,
+) -> CkptType:
     """
     Loads a configuration from a pickle file and constructs an object of the specified type.
 
@@ -643,13 +708,15 @@ def load(path: Path, output_type: Type[CkptType] = Any, subpath: Optional[str] =
     Example:
         loaded_model = load("/path/to/model", output_type=MyModel)
     """
-    _path = Path(path)
+    _path = path
+    if not isinstance(path, PathBase):
+        _path = Path(path)
     _thread_local.output_dir = _path
 
     if hasattr(_path, "is_dir") and _path.is_dir():
-        _path = Path(_path) / "io.json"
+        _path = _path / "io.json"
     elif hasattr(_path, "isdir") and _path.isdir:
-        _path = Path(_path) / "io.json"
+        _path = _path / "io.json"
 
     if not _path.is_file():
         raise FileNotFoundError(f"No such file: '{_path}'")
@@ -658,7 +725,7 @@ def load(path: Path, output_type: Type[CkptType] = Any, subpath: Optional[str] =
         subpath = "<root>." + subpath
 
     ## add IO functionality to custom objects present in the json file
-    with open(_path) as f:
+    with _path.open() as f:
         j = json.load(f)
     for obj, val in j.get("objects", {}).items():
         clss = ".".join([val["type"]["module"], val["type"]["name"]])
@@ -669,7 +736,7 @@ def load(path: Path, output_type: Type[CkptType] = Any, subpath: Optional[str] =
         if not serialization.find_node_traverser(locate(clss)):
             track_io(locate(clss))
 
-    with open(_path, "rb") as f:
+    with _path.open("rb") as f:
         json_config = json.loads(f.read())
 
     root_key = None

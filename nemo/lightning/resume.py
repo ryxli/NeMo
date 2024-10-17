@@ -16,9 +16,11 @@ import json
 import os
 from dataclasses import dataclass
 from pathlib import Path, PosixPath, WindowsPath
+from pathlib_abc import PathBase
 from typing import Optional, Union
 
 import lightning_fabric as fl
+from nemo.utils.s3_dirpath_utils import is_s3_url
 import pytorch_lightning as pl
 
 from nemo.lightning import io
@@ -33,6 +35,9 @@ if os.name == "nt":
     BasePath = WindowsPath
 else:
     BasePath = PosixPath
+# TODO: how to workaround pathlib_abc for this nemo design
+# BasePath = S3Path
+
 
 
 def _try_restore_tokenizer(model, ckpt_path):
@@ -289,6 +294,166 @@ class AutoResume:
                     return Path(checkpoint)
 
         return None
+
+
+@dataclass(kw_only=True)
+class S3AutoResume(AutoResume):
+    def get_weights_path(self, path):
+        return path / self.WEIGHTS_PATH
+
+    def setup(self, trainer: Union[pl.Trainer, fl.Fabric], model=None):
+        if isinstance(trainer, fl.Fabric):
+            raise NotImplementedError("Fabric is not supported yet.")
+
+        trainer_ckpt_path = self.get_trainer_ckpt_path(model)
+        if trainer_ckpt_path:
+            trainer.ckpt_path = trainer_ckpt_path
+            trainer.checkpoint_callback.last_model_path = trainer_ckpt_path
+            # Load artifacts
+            if getattr(self.restore_config, "load_artifacts", False):
+                context_path = self.get_context_path(model)
+                model = _try_restore_tokenizer(model, context_path)
+
+        elif self.restore_config:
+            # new_path = self._try_import_model(
+            #     model=model,
+            #     path=self.restore_config.path,
+            #     adapter_path=self.restore_config.adapter_path,
+            # )
+            # if isinstance(new_path, AdapterPath):
+            #     self.restore_config.path = new_path.base_model_path
+            #     self.restore_config.adapter_path = new_path
+            # else:
+            #     self.restore_config.path = new_path
+            trainer.strategy.restore_config = self.restore_config
+
+    def _try_import_model(
+        self, model: Optional[io.ConnectorMixin], path: os.PathLike | PathBase, adapter_path: Optional[str] = None
+    ) -> PathBase:
+        if model is None:
+            raise ValueError("Model is needed to import checkpoint from HF or other non-NeMo checkpoint format.")
+        try:
+            new_path = model.import_ckpt(path)
+        except (ValueError, AttributeError):
+            # This is reached when the model connector does not exist for the particular path.
+            new_path = path
+
+        if adapter_path:
+            maybe_weights_path = self.get_weights_path(adapter_path)
+            if maybe_weights_path.is_dir():
+                raise NotImplementedError("not implemented for s3 yet")
+                adapter_path = maybe_weights_path
+            new_path = AdapterPath(adapter_path, base_model_path=new_path)
+
+        if not isinstance(new_path, PathBase):
+            new_path = Path(new_path)
+
+        return new_path
+
+    def _resume_peft(self, adapter_meta_path, model):
+        raise NotImplementedError("s3 peft resume not supported yet")
+        # with open(adapter_meta_path, "r") as f:
+        #     metadata = json.load(f)
+
+        # assert self.restore_config, "PEFT resume requires specifying restore_config"
+        # assert (
+        #     "://" in self.restore_config.path
+        # ), "For now PEFT resume requires specifying the import path instead of local path"
+        # base_model_path = self._try_import_model(model, self.restore_config.path)
+        # if base_model_path != Path(metadata["model_ckpt_path"]):
+        #     raise ValueError(
+        #         f"When trying to resume a PEFT training run, found mismatching values: "
+        #         f"your specified restore_path points to {base_model_path}, "
+        #         f"but the PEFT checkpoint was trained with "
+        #         f"model_ckpt_path={metadata['model_ckpt_path']}"
+        #     )
+        # return base_model_path
+
+    def _find_trainer_ckpt_path(self) -> Optional[PathBase]:
+        from nemo.utils.exp_manager import NotFoundError
+
+        # app_state = AppState()
+        # log_dir = app_state.log_dir
+
+        assert self.resume_from_directory, "resume_from_directory should be set for s3 for now"
+        assert is_s3_url(self.resume_from_directory), "resume_from_directory should be an s3 url"
+
+        checkpoint = None
+
+        # Use <log_dir>/checkpoints/ unless `dirpath` is set
+        checkpoint_dir = S3Path(self.resume_from_directory)
+
+        # when using distributed checkpointing, checkpoint_dir is a directory of directories
+        # we check for this here
+        dist_checkpoints = [d for d in list(checkpoint_dir.glob("*")) if d.is_dir()]
+        # for s3, no '-last' or '-end' ckpt
+        if not len(dist_checkpoints) > 0:
+            if self.resume_ignore_no_checkpoint:
+                warn = f"There were no checkpoints found in checkpoint_dir or no checkpoint folder at checkpoint_dir: {checkpoint_dir}. "
+                if checkpoint is None:
+                    warn += "Training from scratch."
+                logging.warning(warn)
+            else:
+                if self.restore_config:
+                    # resume_if_exists is True but run is not resumable. Do not fail and try to do selective restore later instead.
+                    return None
+                else:
+                    raise NotFoundError(
+                        f"There were no checkpoints found in checkpoint_dir or no checkpoint folder at checkpoint_dir: {checkpoint_dir}. Cannot resume."
+                    )
+        else:
+            # Resume from largest step number instead
+            checkpoint = max(dist_checkpoints, key=lambda pth: float(re.search(r"step=(\d+)", pth.name).group(1)))
+            logging.warning(f"Resuming with checkpoint with largest `consumed_samples`: {checkpoint}")
+
+        return checkpoint
+
+    def get_context_path(self, model: Optional[io.ConnectorMixin] = None) -> Optional[Path]:
+        checkpoint = None
+        app_state = AppState()
+        app_state.restore = self.resume_if_exists
+        if self.resume_if_exists:
+            checkpoint = self._find_trainer_ckpt_path()
+
+        if checkpoint:
+            maybe_context_path = checkpoint / "context"
+            if maybe_context_path.is_dir():
+                checkpoint = maybe_context_path
+        return checkpoint
+
+    def get_trainer_ckpt_path(self, model: Optional[io.ConnectorMixin] = None) -> Optional[PathBase]:
+        if self.resume_from_path:
+            maybe_weights_path = self.get_weights_path(self.resume_from_path)
+            return maybe_weights_path if maybe_weights_path.is_dir() else self.resume_from_path
+
+        checkpoint = None
+        app_state = AppState()
+        app_state.restore = self.resume_if_exists
+        if self.resume_if_exists:
+            checkpoint = self._find_trainer_ckpt_path()
+
+        if checkpoint:
+            maybe_weights_path = self.get_weights_path(checkpoint)
+            if maybe_weights_path.is_dir():
+                checkpoint = maybe_weights_path
+
+        if checkpoint:
+            if self.adapter_path:
+                raise NotImplementedError("not implemented for s3 yet")
+                return AdapterPath(Path(self.adapter_path), base_model_path=checkpoint)
+            else:
+                from nemo.lightning.pytorch.callbacks.peft import _ADAPTER_META_FILENAME
+
+                adapter_meta_path = checkpoint / _ADAPTER_META_FILENAME
+                if adapter_meta_path.exists():
+                    raise NotImplementedError("not implemented for s3 yet")
+                    base_model_path = self._resume_peft(adapter_meta_path, model)
+                    return AdapterPath(checkpoint, base_model_path=base_model_path)
+                else:
+                    return checkpoint
+
+        return None
+
 
 
 class AdapterPath(BasePath):

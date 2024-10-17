@@ -33,7 +33,7 @@ from torch.distributed.device_mesh import DeviceMesh
 from typing_extensions import override
 
 from nemo.lightning import _strategy_lib
-from nemo.lightning.io.pl import MegatronCheckpointIO
+from nemo.lightning.io.pl import MegatronCheckpointIO, S3MegatronCheckpointIO
 from nemo.lightning.pytorch.callbacks import MegatronProgressBar, ProgressPrinter
 from nemo.utils.callbacks.dist_ckpt_io import AsyncFinalizableCheckpointIO
 
@@ -132,6 +132,13 @@ def create_checkpoint_io(**kwargs):
     if kwargs.get("async_save", False):
         checkpoint_io = AsyncFinalizableCheckpointIO(checkpoint_io)
 
+    return checkpoint_io
+
+
+def create_s3_checkpoint_io(**kwargs):
+    checkpoint_io = S3MegatronCheckpointIO(**kwargs)
+    if kwargs.get("async_save", False):
+        checkpoint_io = AsyncFinalizableCheckpointIO(checkpoint_io)
     return checkpoint_io
 
 

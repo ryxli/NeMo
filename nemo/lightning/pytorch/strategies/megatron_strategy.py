@@ -18,7 +18,7 @@ import os
 import shutil
 from collections import OrderedDict
 from contextlib import ExitStack, contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, is_dataclass
 from pathlib import Path
 from typing import (
     TYPE_CHECKING,
@@ -34,7 +34,9 @@ from typing import (
     Union,
     cast,
 )
+import fiddle._src.experimental.dataclasses as fdl_dc
 
+from nemo.lightning.io.capture import IOProtocol
 import pytorch_lightning as pl
 import torch
 import torch.distributed
@@ -70,6 +72,7 @@ from nemo.lightning.pytorch.strategies.utils import (
     _MegatronBatchProgress,
     ckpt_to_dir,
     create_checkpoint_io,
+    create_s3_checkpoint_io,
     fix_progress_bar,
     init_model_parallel,
     setup_data_sampler,
@@ -199,6 +202,7 @@ class MegatronStrategy(DDPStrategy, io.IOMixin):
         ckpt_parallel_load: bool = False,
         ckpt_parallel_save_optim: bool = True,
         ckpt_load_directly_on_device: bool = True,
+        ckpt_use_s3: bool = False,
         setup_optimizers: bool = True,
         init_model_parallel: bool = True,
         replace_progress_bar: bool = True,
@@ -242,7 +246,8 @@ class MegatronStrategy(DDPStrategy, io.IOMixin):
         self.parallel_load = ckpt_parallel_load
         self.parallel_save_optim = ckpt_parallel_save_optim
         self.load_directly_on_device = ckpt_load_directly_on_device
-
+        self.use_s3_ckpt_io = ckpt_use_s3
+        
         self.replace_progress_bar = replace_progress_bar
         self.progress_interval = progress_interval
         self.overwrite_batch_progress = overwrite_batch_progress
@@ -756,8 +761,10 @@ class MegatronStrategy(DDPStrategy, io.IOMixin):
     @override
     def checkpoint_io(self) -> CheckpointIO:
         if not self._checkpoint_io:
+            _create_ckpt_io_fn = create_checkpoint_io if not self.use_s3_ckpt_io else create_s3_checkpoint_io
+            
             self._checkpoint_io = create_checkpoint_io(
-                save_ckpt_format=self.save_ckpt_format,
+                save_ckpt_format=self.save_ckpt_format if not self.use_s3_ckpt_io else "torch_dist",
                 async_save=self.async_save,
                 torch_dist_multiproc=self.torch_dist_multiproc,
                 assume_constant_structure=self.assume_constant_structure,
@@ -828,6 +835,24 @@ class MegatronStrategy(DDPStrategy, io.IOMixin):
         # @akoumparouli: using Parent's tensor_init_context causes mcore
         # parameters to be initialized on GPU instead of (assumed) CPU.
         yield
+
+
+    def io_transform_args(self, init_fn, *args, **kwargs) -> Dict[str, Any]:
+        config_kwargs = super().io_transform_args(init_fn, *args, **kwargs)
+        extra_kwargs = {k: v for k, v in kwargs.items() if k not in config_kwargs}
+        to_del = []
+        for key in extra_kwargs:
+            if isinstance(extra_kwargs[key], IOProtocol):
+                extra_kwargs[key] = extra_kwargs[key].__io__
+            if is_dataclass(extra_kwargs[key]):
+                extra_kwargs[key] = fdl_dc.convert_dataclasses_to_configs(extra_kwargs[key], allow_post_init=True)
+                # Check if the arg is a factory (dataclasses.field)
+            if extra_kwargs[key].__class__.__name__ == "_HAS_DEFAULT_FACTORY_CLASS":
+                to_del.append(key)
+        for key in to_del:
+            del extra_kwargs[key]
+        config_kwargs["kwargs"] = extra_kwargs
+        return config_kwargs
 
 
 def _data_fetcher_wrapper(fn):

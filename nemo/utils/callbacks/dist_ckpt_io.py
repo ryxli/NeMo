@@ -181,6 +181,36 @@ class AsyncFinalizerCallback(Callback):
         return checkpoint_io
 
 
+MAX_NUM_UNFINALIZED_CALLS = 5
+
+
+class SemiAsyncFinalizerCallback(AsyncFinalizerCallback):
+    """
+    Tries to perform non-blocking finalization on train_batch_end and train_epoch_end,
+    except when async queue exceeds a certain limit.
+
+    We run blocking in this case to prevent S3 bottleneck, although this happens
+    only in extreme cases with small checkpointing intervals.
+    """
+
+    def on_train_batch_end(self, trainer: "pl.Trainer", *args, **kwargs) -> None:
+        blocking = self._should_block(trainer)
+        self._get_checkpoint_io(trainer).maybe_finalize_save_checkpoint(blocking=blocking)
+
+    def on_train_epoch_end(self, trainer: "pl.Trainer", *args, **kwargs) -> None:
+        blocking = self._should_block(trainer)
+        self._get_checkpoint_io(trainer).maybe_finalize_save_checkpoint(blocking=blocking)
+
+    def _should_block(self, trainer):
+        num_unfinalized_calls = self._get_checkpoint_io(trainer).async_calls_queue.get_num_unfinalized_calls()
+
+        if num_unfinalized_calls < MAX_NUM_UNFINALIZED_CALLS:
+            return False
+
+        logging.info(f"Async queue has {num_unfinalized_calls} unfinalized calls, blocking until all are complete")
+        return True
+
+
 class DistributedCheckpointIO(AsyncCompatibleCheckpointIO):
     """CheckpointIO for a distributed checkpoint format.
 

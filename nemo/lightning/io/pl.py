@@ -1,7 +1,8 @@
 import logging
 from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Any, Callable, Dict, Generic, Optional, TypeVar, Union
+from nemo.utils.s3_dirpath_utils import is_s3_url
+import pathlib_abc
+from typing import Any, Callable, Dict, Generic, Optional, TypeVar
 
 import pytorch_lightning as pl
 import torch
@@ -292,3 +293,146 @@ def is_distributed_ckpt(path) -> bool:
         return True
 
     return False
+
+
+# TODO: combine
+class S3MegatronCheckpointIO(MegatronCheckpointIO):
+    @override
+    def save_checkpoint(
+        self,
+        checkpoint: Dict[str, Any],
+        path: _PATH | pathlib_abc.PathBase,
+        storage_options: Optional[Any] = None,
+    ) -> None:
+        if not is_s3_url(str(path)):
+            super().save_checkpoint(checkpoint, path, storage_options)
+        elif not isinstance(path, pathlib_abc.PathBase):
+            path = S3Path(str(path))
+
+        from megatron.core import dist_checkpointing
+
+        checkpoint_dir = ckpt_to_dir(path)
+        if dist_checkpointing.check_is_distributed_checkpoint(checkpoint_dir):
+            logging.info(f"Distributed checkpoint at path {checkpoint_dir} already exists, skipping saving")
+            return
+        checkpoint_dir.mkdir(exist_ok=True)
+
+        from megatron.core import dist_checkpointing
+
+        validate_sharding_integrity = not (self.validated_consistency and self.assume_constant_structure)
+        self.validated_consistency = True
+
+        try:
+            return dist_checkpointing.save(
+                sharded_state_dict=checkpoint,
+                checkpoint_dir=path,
+                sharded_strategy=self.save_sharded_strategy,
+                common_strategy=S3TorchCommonSaveStrategy("torch", 1),
+                validate_access_integrity=validate_sharding_integrity,
+                async_sharded_save=self.async_save,
+            )  # type: ignore
+        except:
+            logging.error(f"Failed to save checkpoint to {path}")
+            # Do cleanup.
+            self._rmtree(path)
+            raise
+
+    def load_checkpoint(
+        self, path: _PATH | pathlib_abc.PathBase, sharded_state_dict=None, map_location: Optional[Callable] = None
+    ) -> Dict[str, Any]:
+        if not is_s3_url(str(path)):
+            return super().load_checkpoint(path, sharded_state_dict, map_location)
+        elif not isinstance(path, pathlib_abc.PathBase):
+            path = S3Path(str(path))
+
+        from megatron.core import dist_checkpointing
+
+        if map_location is not None:
+            raise ValueError("`map_location` argument is not supported for `MegatronCheckpointIO.load_checkpoint`.")
+
+        path = ckpt_to_dir(path)
+        if not path.exists():
+            raise FileNotFoundError(f"Checkpoint file not found: {path}")
+        if not path.is_dir():
+            raise ValueError(f"Distributed checkpoints should be a directory. Found: {path}.")
+
+        if self.save_ckpt_format == "zarr" and self.load_directly_on_device:
+            raise ValueError("zarr not supported, use torch_dist")
+        sharded_strategy = S3TorchDistLoadShardedStrategy()
+
+        if self.parallel_load:
+            # TODO: check/support parallel load for s3
+            # if sharded_strategy is None:
+            #     # sharded_strategy = get_default_load_sharded_strategy(path)
+            sharded_strategy = FullyParallelLoadStrategyWrapper(
+                sharded_strategy, get_data_parallel_group(with_context_parallel=True)
+            )
+
+        if sharded_strategy is not None:
+            logging.info(f"Using {sharded_strategy} dist-ckpt load strategy.")
+
+        checkpoint = dist_checkpointing.load(
+            sharded_state_dict=sharded_state_dict,
+            checkpoint_dir=path,
+            sharded_strategy=sharded_strategy,
+            common_strategy=S3TorchCommonLoadStrategy(),
+        )
+        checkpoint = _fix_tensors_device(checkpoint)
+
+        return checkpoint
+
+    @override
+    def remove_checkpoint(self, path: _PATH | pathlib_abc.PathBase) -> None:
+        """Remove checkpoint file from the filesystem.
+
+        Args:
+            path: Path to checkpoint
+
+        """
+        if not is_s3_url(path):
+            super().remove_checkpoint(path)
+        path = S3Path(str(path))
+        path.unlink(missing_ok=True)
+        log.debug(f"Removed checkpoint: {path}")
+
+    def _rmtree(self, path: S3Path) -> None:
+        for p in path.iterdir():
+            p.unlink(missing_ok=True)
+        path.rmdir()
+
+    def _determine_dist_ckpt_save_strategy(self):
+        """Determine the saving strategy based on constructor args.
+
+        Relies on the default MCore strategy unless extra PyT Distributed format arguments
+        are passed in config or in case of a fully parallel save in which case
+        a parallelization wrapper is applied.
+        """
+        if self.async_save and self.save_ckpt_format != "torch_dist":
+            raise ValueError("Async dist-ckpt save supported only for torch_dist format")
+
+        torch_dist_kwargs = {} if self.torch_dist_multiproc is None else dict(thread_count=self.torch_dist_multiproc)
+        if self.save_ckpt_format == "torch_dist" and torch_dist_kwargs:
+            save_strategy = S3TorchDistSaveShardedStrategy(self.save_ckpt_format, 1, **torch_dist_kwargs)
+            # save_strategy = TorchDistSaveShardedStrategy(self.save_ckpt_format, 1, **torch_dist_kwargs)
+        else:
+            save_strategy = S3TorchDistSaveShardedStrategy(self.save_ckpt_format, 1)
+            # save_strategy = get_default_save_sharded_strategy(self.save_ckpt_format, 1)
+
+        # MCore v0.8 introduces `use_cached_ckpt_structure` attribute
+        if hasattr(save_strategy, "use_cached_ckpt_structure"):
+            save_strategy.use_cached_ckpt_structure = self.assume_constant_structure
+
+        if self.parallel_save:
+            parallelization_group = (
+                get_data_parallel_group(with_context_parallel=True) if self.parallel_save_within_dp else None
+            )
+            save_strategy = FullyParallelSaveStrategyWrapper(
+                save_strategy, parallelization_group, self.assume_constant_structure
+            )
+
+        logging.info(f"Using {save_strategy} dist-ckpt save strategy.")
+        return save_strategy
+
+    def teardown(self) -> None:
+        """This method is called to teardown the process."""
+        pass

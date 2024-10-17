@@ -17,14 +17,17 @@ import re
 import shutil
 from datetime import timedelta
 from pathlib import Path
+from pathlib_abc import PathBase
 from typing import Any, Dict, Iterable, List, Optional, Union
 
+from nemo.utils.s3_dirpath_utils import is_s3_url
 import pytorch_lightning
 import torch
 from _weakref import proxy
 from pytorch_lightning.callbacks.model_checkpoint import ModelCheckpoint as PTLModelCheckpoint
 from pytorch_lightning.callbacks.model_checkpoint import _is_local_file_protocol
 from pytorch_lightning.utilities import rank_zero_info
+from lightning_fabric.utilities.types import _PATH
 
 from nemo.lightning.ckpt_utils import ckpt_to_dir
 from nemo.lightning.io.pl import TrainerContext
@@ -228,9 +231,14 @@ class ModelCheckpoint(PTLModelCheckpoint):
     def _remove_invalid_entries_from_topk(self):
         # Removes invalid (incomplete or not existing) checkpoints from topk checkpoints.
         # This might be needed if the checkpointing was abruptly terminated.
-        def __is_ckpt_ok(ckpt_path: str) -> bool:
-            exists = os.path.isdir(ckpt_path.removesuffix('.ckpt'))
-            return exists and not self.is_checkpoint_unfinished(ckpt_path)
+        def __is_ckpt_ok(ckpt_path: PathBase) -> bool:
+            if ckpt_path.suffix == ".ckpt":
+                ckpt_path = ckpt_path.with_suffix("")
+            exists = ckpt_path.is_dir()
+            # need to check unfinished for s3?
+            if is_s3_url(ckpt_path):
+                return exists and not self.is_checkpoint_unfinished(ckpt_path)
+            return exists
 
         self.best_k_models = {k: v for k, v in self.best_k_models.items() if __is_ckpt_ok(k)}
         if len(self.best_k_models) > 0:
@@ -262,13 +270,26 @@ class ModelCheckpoint(PTLModelCheckpoint):
 
         if is_global_rank_zero():
             logging.debug("Removing unfinished checkpoints if any...")
+            # TODO: check s3 here
             ModelCheckpoint._remove_unfinished_checkpoints(self.dirpath)
         # Ensure that all ranks continue with unfinished checkpoints removed
         if torch.distributed.is_initialized():
             torch.distributed.barrier()
 
         self.async_save = getattr(trainer.strategy, "async_save", False)
-        super().setup(trainer, *args, **kwargs)
+        
+        # TODO: figure out logic here
+        some_s3_flag = False
+        if some_s3_flag:
+            dirpath = PTLModelCheckpoint._ModelCheckpoint__resolve_ckpt_dir(self, trainer)
+            self.dirpath = dirpath
+
+            if trainer.is_global_zero and stage == "fit":
+                PTLModelCheckpoint._ModelCheckpoint__warn_if_dir_not_empty(self, self.dirpath)
+            if self.save_last == "link":
+                raise ValueError("`ModelCheckpoint(save_last='link')` not supported for S3ModelCheckpoint")
+        else:
+            super().setup(trainer, *args, **kwargs)
 
     def on_train_end(self, trainer, pl_module):
         from nemo.utils.get_rank import is_global_rank_zero
@@ -589,6 +610,10 @@ class ModelCheckpoint(PTLModelCheckpoint):
         if not is_global_rank_zero():
             raise AssertionError("_remove_unfinished_checkpoints should run only on rank 0")
 
+        if is_s3_url(str(checkpoint_dir)):
+            # no "unfinished marker" in s3
+            return
+
         checkpoint_dir = Path(checkpoint_dir)
 
         existing_marker_filepaths = {
@@ -639,3 +664,26 @@ class ModelCheckpoint(PTLModelCheckpoint):
             raise ValueError(f"{self.__class__}.dirpath is None.")
         dirpath = Path(self.dirpath).absolute()
         return dirpath in previous.parents
+
+    def _ModelCheckpoint__init_ckpt_dir(self, dirpath: Optional[_PATH], filename: Optional[str]) -> None:
+        if not is_s3_url(dirpath):
+            return PTLModelCheckpoint._ModelCheckpoint__init_ckpt_dir(self, dirpath, filename)
+        self._fs = VirtualFileSystem()
+        self.dirpath = S3Path(dirpath)
+        self.filename = filename
+
+    def format_checkpoint_name(
+        self, metrics: Dict[str, torch.Tensor], filename: Optional[str] = None, ver: Optional[int] = None
+    ) -> str:
+        """Generate a filename according to the defined template."""
+
+        filename = filename or self.filename
+        filename = self._format_checkpoint_name(
+            filename, metrics, auto_insert_metric_name=self.auto_insert_metric_name
+        )
+
+        if ver is not None:
+            filename = self.CHECKPOINT_JOIN_CHAR.join((filename, f"v{ver}"))
+
+        ckpt_name = f"{filename}{self.FILE_EXTENSION}"
+        return self.dirpath / ckpt_name if self.dirpath else ckpt_name
